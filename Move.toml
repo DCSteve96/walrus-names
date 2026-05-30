@@ -3,9 +3,4 @@ name = "walrus_names"
 edition = "2024.beta"
 
 [addresses]
-walrus_names    = "0x0"
-vesting_service = "0x0"
-
-[dependencies]
-Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/testnet", override = true }
-vesting_service = { local = "../vesting-frontend/contract" }
+walrus_names = "0x0"
