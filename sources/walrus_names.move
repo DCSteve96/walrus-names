@@ -9,13 +9,10 @@
 ///   3 chars  : fee_base × 25 (default 12.5 SUI)
 ///
 /// Security notes:
-///   - NameCap has NO `store` ability: direct transfer is impossible.
-///     Ownership changes MUST go through transfer_name(), keeping the
-///     registry owner field always in sync.
-///   - AdminCap has NO `store` ability: same protection applies.
-///   - Frontrunning: names are first-come-first-served on-chain.
-///     A commit-reveal scheme was omitted for v1 simplicity.
-///   - blob_id max length is capped at MAX_BLOB_LEN bytes.
+///   - NameCap has NO `store`: direct transfer impossible, must use transfer_name()
+///   - AdminCap has NO `store`: same protection
+///   - payment is taken by VALUE: wallet shows the exact fee, no confusion
+///   - blob_id capped at MAX_BLOB_LEN bytes
 ///
 #[allow(lint(self_transfer, public_entry))]
 module walrus_names::walrus_names {
@@ -23,9 +20,17 @@ module walrus_names::walrus_names {
     use std::string::{Self, String};
     use sui::balance::{Self, Balance};
     use sui::coin::{Self, Coin};
+    use sui::display;
     use sui::event;
+    use sui::package;
     use sui::sui::SUI;
     use sui::table::{Self, Table};
+
+    // =========================================================================
+    // One-time witness (required for Display)
+    // =========================================================================
+
+    public struct WALRUS_NAMES has drop {}
 
     // =========================================================================
     // Errors
@@ -44,20 +49,16 @@ module walrus_names::walrus_names {
     // Constants
     // =========================================================================
 
-    /// Default base fee: 0.5 SUI in MIST. Updatable by admin.
-    const DEFAULT_FEE_BASE: u64 = 500_000_000;
-
+    const FEE_BASE:     u64 = 500_000_000; // 0.5 SUI in MIST
     const MIN_LEN:      u64 = 3;
     const MAX_LEN:      u64 = 63;
-    const MAX_BLOB_LEN: u64 = 256; // max blob_id / URL length
+    const MAX_BLOB_LEN: u64 = 256;
 
     // =========================================================================
     // Structs
     // =========================================================================
 
-    /// Admin capability — minted once at init, sent to deployer.
-    /// NO `store`: cannot be wrapped or transferred via public_transfer.
-    /// Use transfer_admin() to hand it off.
+    /// Admin capability — NO `store`, use transfer_admin() to move it.
     public struct AdminCap has key { id: UID }
 
     /// Shared treasury collecting registration fees.
@@ -74,16 +75,14 @@ module walrus_names::walrus_names {
         total_registered: u64,
     }
 
-    /// On-chain record for a registered name.
+    /// On-chain record stored inside the Registry Table.
     public struct NameRecord has store {
         owner:   address,
         blob_id: String,
     }
 
     /// NFT proving ownership of a `.epoch` name.
-    /// NO `store`: prevents direct transfer via public_transfer.
-    /// All ownership changes MUST go through transfer_name(),
-    /// which keeps registry.owner in sync. This prevents registry desync.
+    /// NO `store` → only transfer_name() can move it, keeping registry in sync.
     public struct NameCap has key {
         id:   UID,
         name: String,
@@ -120,18 +119,32 @@ module walrus_names::walrus_names {
     // Init
     // =========================================================================
 
-    fun init(ctx: &mut TxContext) {
+    fun init(otw: WALRUS_NAMES, ctx: &mut TxContext) {
         let deployer = ctx.sender();
 
-        // AdminCap: no `store`, transferred via internal transfer only
+        // ── Display for NameCap ──────────────────────────────────────────────
+        // Wallets read these fields to render the NFT with name + image.
+        let publisher = package::claim(otw, ctx);
+        let mut disp = display::new<NameCap>(&publisher, ctx);
+        disp.add(string::utf8(b"name"),        string::utf8(b"{name}.epoch"));
+        disp.add(string::utf8(b"description"), string::utf8(b"A .epoch name on Epoch Sites — decentralised website hosting on Walrus & Sui."));
+        disp.add(string::utf8(b"image_url"),   string::utf8(b"https://epochsui.com/epoch-name-nft.png"));
+        disp.add(string::utf8(b"link"),        string::utf8(b"https://{name}.epochsui.com"));
+        disp.update_version();
+        transfer::public_transfer(publisher, deployer);
+        transfer::public_transfer(disp, deployer);
+
+        // ── AdminCap ─────────────────────────────────────────────────────────
         transfer::transfer(AdminCap { id: object::new(ctx) }, deployer);
 
+        // ── Treasury ─────────────────────────────────────────────────────────
         transfer::share_object(WalNamesTreasury {
             id:       object::new(ctx),
             balance:  balance::zero<SUI>(),
-            fee_base: DEFAULT_FEE_BASE,
+            fee_base: FEE_BASE,
         });
 
+        // ── Registry ─────────────────────────────────────────────────────────
         transfer::share_object(Registry {
             id:               object::new(ctx),
             records:          table::new(ctx),
@@ -143,51 +156,58 @@ module walrus_names::walrus_names {
     // Entry functions
     // =========================================================================
 
-    /// Register a new `.epoch` name. Mints a NameCap NFT to the caller.
-    /// Fee is computed from name length using treasury.fee_base.
+    /// Register a new `.epoch` name.
+    /// payment is taken BY VALUE — the wallet shows the exact fee deducted.
+    /// Any excess is returned to the sender.
     public fun register(
         registry: &mut Registry,
         treasury: &mut WalNamesTreasury,
         name:     String,
         blob_id:  String,
-        payment:  &mut Coin<SUI>,
+        mut payment: Coin<SUI>,
         ctx:      &mut TxContext,
     ) {
         let bytes    = string::as_bytes(&name);
         let name_len = vector::length(bytes);
         let blob_len = string::length(&blob_id);
 
-        assert!(name_len >= MIN_LEN,                             ENameTooShort);
-        assert!(name_len <= MAX_LEN,                             ENameTooLong);
-        assert!(blob_len > 0,                                    EBlobIdEmpty);
-        assert!(blob_len <= MAX_BLOB_LEN,                        EBlobIdTooLong);
-        assert!(!table::contains(&registry.records, name),      ENameTaken);
+        assert!(name_len >= MIN_LEN,                            ENameTooShort);
+        assert!(name_len <= MAX_LEN,                            ENameTooLong);
+        assert!(blob_len > 0,                                   EBlobIdEmpty);
+        assert!(blob_len <= MAX_BLOB_LEN,                       EBlobIdTooLong);
+        assert!(!table::contains(&registry.records, name),     ENameTaken);
         validate_chars(bytes);
 
         let fee = registration_fee(treasury.fee_base, name_len);
-        assert!(coin::value(payment) >= fee, EInsufficientFee);
+        assert!(coin::value(&payment) >= fee, EInsufficientFee);
 
-        let fee_coin = coin::split(payment, fee, ctx);
+        // Split exact fee → treasury
+        let fee_coin = coin::split(&mut payment, fee, ctx);
         balance::join(&mut treasury.balance, coin::into_balance(fee_coin));
 
-        let owner = ctx.sender();
-        table::add(&mut registry.records, name, NameRecord { owner, blob_id });
+        // Return change (if any) to sender
+        let sender = ctx.sender();
+        if (coin::value(&payment) > 0) {
+            transfer::public_transfer(payment, sender);
+        } else {
+            coin::destroy_zero(payment);
+        };
+
+        table::add(&mut registry.records, name, NameRecord { owner: sender, blob_id });
         registry.total_registered = registry.total_registered + 1;
 
-        // NameCap has no `store` → only transfer::transfer (module-internal) works
         let cap = NameCap { id: object::new(ctx), name };
 
         event::emit(NameRegistered {
             name:    cap.name,
-            owner,
+            owner:   sender,
             blob_id: table::borrow(&registry.records, cap.name).blob_id,
         });
 
-        transfer::transfer(cap, owner);
+        transfer::transfer(cap, sender);
     }
 
-    /// Update the Walrus blob ID this name resolves to.
-    /// Only callable by the NameCap holder (Move ownership enforces this).
+    /// Update the Walrus blob ID. Only the NameCap holder can call this.
     public fun update_blob(
         registry:    &mut Registry,
         cap:         &NameCap,
@@ -195,23 +215,15 @@ module walrus_names::walrus_names {
         _ctx:        &mut TxContext,
     ) {
         let blob_len = string::length(&new_blob_id);
-        assert!(blob_len > 0,           EBlobIdEmpty);
+        assert!(blob_len > 0,             EBlobIdEmpty);
         assert!(blob_len <= MAX_BLOB_LEN, EBlobIdTooLong);
-
         let record = table::borrow_mut(&mut registry.records, cap.name);
         let old = record.blob_id;
         record.blob_id = new_blob_id;
-
-        event::emit(BlobUpdated {
-            name:        cap.name,
-            old_blob_id: old,
-            new_blob_id: record.blob_id,
-        });
+        event::emit(BlobUpdated { name: cap.name, old_blob_id: old, new_blob_id: record.blob_id });
     }
 
-    /// Transfer name ownership to another address.
-    /// This is the ONLY way to move a NameCap — it keeps the registry in sync.
-    /// Direct transfer::public_transfer is impossible (no `store` on NameCap).
+    /// Transfer name ownership. ONLY way to move a NameCap (no `store`).
     public fun transfer_name(
         registry: &mut Registry,
         cap:      NameCap,
@@ -221,11 +233,10 @@ module walrus_names::walrus_names {
         let from = ctx.sender();
         table::borrow_mut(&mut registry.records, cap.name).owner = to;
         event::emit(NameTransferred { name: cap.name, from, to });
-        // NameCap has no `store` → must use module-internal transfer
         transfer::transfer(cap, to);
     }
 
-    /// Withdraw all fees to sender. Only AdminCap holder.
+    /// Withdraw all fees. Only AdminCap holder.
     public fun withdraw_fees(
         _cap:     &AdminCap,
         treasury: &mut WalNamesTreasury,
@@ -238,7 +249,7 @@ module walrus_names::walrus_names {
         }
     }
 
-    /// Update the base registration fee. Only AdminCap holder.
+    /// Update base fee. Only AdminCap holder.
     public fun update_fee(
         _cap:         &AdminCap,
         treasury:     &mut WalNamesTreasury,
@@ -249,8 +260,7 @@ module walrus_names::walrus_names {
         event::emit(FeeUpdated { old_fee_base: old, new_fee_base });
     }
 
-    /// Transfer AdminCap to a new address.
-    /// This is the ONLY way to move AdminCap (no `store`).
+    /// Transfer AdminCap to another address.
     public fun transfer_admin(cap: AdminCap, to: address) {
         transfer::transfer(cap, to);
     }
@@ -259,7 +269,6 @@ module walrus_names::walrus_names {
     // Read-only
     // =========================================================================
 
-    /// Resolve name → blob_id. Returns empty string if not registered.
     public fun resolve(registry: &Registry, name: String): String {
         if (table::contains(&registry.records, name)) {
             table::borrow(&registry.records, name).blob_id
@@ -285,7 +294,6 @@ module walrus_names::walrus_names {
         treasury.fee_base
     }
 
-    /// Compute registration fee for a given fee_base and name length.
     public fun registration_fee(fee_base: u64, len: u64): u64 {
         if      (len == 3) { fee_base * 25 }
         else if (len == 4) { fee_base * 5  }
@@ -298,13 +306,11 @@ module walrus_names::walrus_names {
 
     fun validate_chars(bytes: &vector<u8>) {
         let len = vector::length(bytes);
-        // No leading or trailing hyphen
         assert!(*vector::borrow(bytes, 0)       != 45u8, ENameInvalidChars);
         assert!(*vector::borrow(bytes, len - 1) != 45u8, ENameInvalidChars);
         let mut i = 0;
         while (i < len) {
             let c = *vector::borrow(bytes, i);
-            // Allowed: a-z (97-122), 0-9 (48-57), hyphen (45)
             assert!(
                 (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45,
                 ENameInvalidChars
