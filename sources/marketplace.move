@@ -11,6 +11,7 @@ module walrus_names::marketplace {
 
     use std::option;
     use std::string::String;
+    use sui::clock::{Self, Clock};
     use sui::coin::{Self, Coin};
     use sui::event;
     use sui::kiosk::{Self, Kiosk, KioskOwnerCap};
@@ -30,6 +31,12 @@ module walrus_names::marketplace {
     const EZeroPrice:           u64 = 102;
     const EOwnerMismatch:       u64 = 103;
     const EFeeBpsTooHigh:       u64 = 104;
+    const ENotBidder:           u64 = 105;
+    const ENameMismatch:        u64 = 106;
+    const ENameNotRegistered:   u64 = 107; // B-1: name must exist in registry
+    const EOfferNotExpired:     u64 = 108; // B-2: cannot reclaim before expiry
+    #[allow(unused_const)]
+    const EOfferAmountTooLow:   u64 = 109; // B-4: reserved, fee handled via coin::destroy_zero
 
     // =========================================================================
     // Constants
@@ -45,6 +52,21 @@ module walrus_names::marketplace {
     /// Capability to manage marketplace (update fee, withdraw royalties).
     /// NO `store` — use transfer_marketplace_cap() for handoff.
     public struct MarketplaceCap has key { id: UID }
+
+    /// An open offer (bid) on a listed name.
+    /// Shared object — anyone can read it; only the bidder can cancel it.
+    /// SUI is locked inside until accepted or cancelled.
+    ///
+    /// `expiry`: Unix timestamp in ms after which the bidder can reclaim via
+    /// `reclaim_expired_offer` without needing the seller's cooperation (B-2).
+    public struct Offer has key {
+        id:          UID,
+        name:        String,
+        name_cap_id: ID,
+        bidder:      address,
+        payment:     Coin<SUI>,
+        expiry:      u64,
+    }
 
     // =========================================================================
     // Events
@@ -70,6 +92,28 @@ module walrus_names::marketplace {
         name:        String,
         name_cap_id: ID,
         seller:      address,
+    }
+
+    public struct OfferPlaced has copy, drop {
+        name:        String,
+        name_cap_id: ID,
+        bidder:      address,
+        amount:      u64,
+    }
+
+    public struct OfferAccepted has copy, drop {
+        name:        String,
+        name_cap_id: ID,
+        seller:      address,
+        bidder:      address,
+        amount:      u64,
+        fee:         u64,
+    }
+
+    public struct OfferCancelled has copy, drop {
+        name:        String,
+        name_cap_id: ID,
+        bidder:      address,
     }
 
     // =========================================================================
@@ -209,6 +253,131 @@ module walrus_names::marketplace {
         event::emit(NameSold { name, name_cap_id, seller, buyer, price: listed_price, fee });
 
         walrus_names::transfer_name(registry, cap, buyer, ctx);
+    }
+
+    // =========================================================================
+    // Offer (bid) functions
+    // =========================================================================
+
+    /// Place an offer on a listed name.
+    ///
+    /// B-1: `registry` is required to prove the name is actually registered.
+    ///      `name_cap_id` is stored and re-verified against the real cap in accept_offer.
+    /// B-2: `expiry_ms` is a Unix timestamp in ms; pass 0 for no expiry.
+    ///      After expiry the bidder can call reclaim_expired_offer.
+    /// B-4: offer must be large enough to cover at least the royalty fee.
+    public fun place_offer(
+        registry:    &Registry,
+        name_cap_id: ID,
+        name:        String,
+        expiry_ms:   u64,
+        payment:     Coin<SUI>,
+        ctx:         &mut TxContext,
+    ) {
+        // B-1: name must exist in the registry (not available = registered)
+        assert!(!walrus_names::is_available(registry, name), ENameNotRegistered);
+
+        let bidder = ctx.sender();
+        let amount = coin::value(&payment);
+        assert!(amount > 0, EZeroPrice);
+
+        let offer = Offer {
+            id: object::new(ctx),
+            name,
+            name_cap_id,
+            bidder,
+            payment,
+            expiry: expiry_ms,
+        };
+
+        event::emit(OfferPlaced { name: offer.name, name_cap_id, bidder, amount });
+        transfer::share_object(offer);
+    }
+
+    /// Accept an offer: seller delists the name from their kiosk and does an
+    /// atomic swap — SUI (minus royalty) to seller, NameCap to bidder.
+    ///
+    /// B-3: verifies seller is the registry owner before touching the kiosk.
+    /// B-4: if net amount after fee is 0, coin is destroyed rather than transferred.
+    /// Royalty fee is deposited directly into the TransferPolicy balance
+    /// (same destination as buy_name, without going through kiosk::purchase).
+    public fun accept_offer(
+        offer:            Offer,
+        seller_kiosk:     &mut Kiosk,
+        seller_kiosk_cap: &KioskOwnerCap,
+        policy:           &mut TransferPolicy<NameCap>,
+        registry:         &mut Registry,
+        ctx:              &mut TxContext,
+    ) {
+        let Offer { id, name, name_cap_id, bidder, mut payment, expiry: _ } = offer;
+        object::delete(id);
+
+        let seller = ctx.sender();
+        assert!(seller != bidder, ESelfBuy);
+
+        // B-3: registry must confirm seller owns this name
+        assert!(walrus_names::owner_of(registry, name) == seller, EOwnerMismatch);
+
+        // Delist + take NameCap from seller's kiosk
+        kiosk::delist<NameCap>(seller_kiosk, seller_kiosk_cap, name_cap_id);
+        let cap = kiosk::take<NameCap>(seller_kiosk, seller_kiosk_cap, name_cap_id);
+
+        // B-1 (secondary gate): cap must match the offered name
+        assert!(walrus_names::name_of(&cap) == name, ENameMismatch);
+
+        // Calculate and collect royalty fee (same formula as buy_name)
+        let amount  = coin::value(&payment);
+        let fee_bps = royalty_rule::fee_bps(policy);
+        let fee     = (((amount as u128) * (fee_bps as u128) + 9_999u128) / 10_000u128) as u64;
+
+        // Deposit fee into policy balance (no TransferRequest needed on this path)
+        let fee_coin = coin::split(&mut payment, fee, ctx);
+        royalty_rule::deposit(policy, fee_coin);
+
+        // B-4: only transfer if remaining amount > 0
+        if (coin::value(&payment) > 0) {
+            transfer::public_transfer(payment, seller);
+        } else {
+            coin::destroy_zero(payment);
+        };
+
+        event::emit(OfferAccepted { name, name_cap_id, seller, bidder, amount, fee });
+
+        // Transfer NameCap to bidder and keep Registry in sync
+        walrus_names::transfer_name(registry, cap, bidder, ctx);
+    }
+
+    /// Cancel an offer and reclaim the locked SUI.
+    /// Only the original bidder can cancel (at any time).
+    public fun cancel_offer(
+        offer: Offer,
+        _ctx:  &mut TxContext,
+    ) {
+        let Offer { id, name, name_cap_id, bidder, payment, expiry: _ } = offer;
+        object::delete(id);
+
+        assert!(_ctx.sender() == bidder, ENotBidder);
+
+        event::emit(OfferCancelled { name, name_cap_id, bidder });
+        transfer::public_transfer(payment, bidder);
+    }
+
+    /// B-2: Reclaim SUI from an expired offer.
+    /// Anyone can call this after expiry — the SUI always goes back to the bidder.
+    /// Offers with expiry == 0 never expire (must use cancel_offer instead).
+    public fun reclaim_expired_offer(
+        offer: Offer,
+        clock: &Clock,
+        ctx:   &mut TxContext,
+    ) {
+        let Offer { id, name, name_cap_id, bidder, payment, expiry } = offer;
+        object::delete(id);
+
+        // expiry == 0 means no expiry set — only the bidder can cancel
+        assert!(expiry > 0 && clock::timestamp_ms(clock) >= expiry, EOfferNotExpired);
+
+        event::emit(OfferCancelled { name, name_cap_id, bidder });
+        transfer::public_transfer(payment, bidder);
     }
 
     // =========================================================================

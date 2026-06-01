@@ -102,6 +102,16 @@ module walrus_names::royalty_rule {
         transfer_policy::add_receipt(Rule {}, request);
     }
 
+    /// Deposit a fee coin directly into the policy balance.
+    /// Used by marketplace::accept_offer (no TransferRequest available on that path).
+    /// Restricted to the same package so only marketplace can call it.
+    public(package) fun deposit(
+        policy:   &mut TransferPolicy<NameCap>,
+        fee_coin: Coin<SUI>,
+    ) {
+        transfer_policy::add_to_balance(Rule {}, policy, fee_coin);
+    }
+
     // =========================================================================
     // Read-only
     // =========================================================================

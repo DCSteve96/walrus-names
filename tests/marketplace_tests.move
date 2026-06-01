@@ -7,12 +7,13 @@ module walrus_names::marketplace_tests {
     use sui::test_scenario as ts;
     use sui::transfer_policy::{Self, TransferPolicy, TransferPolicyCap};
     use walrus_names::walrus_names::{Self, Registry, NameCap};
-    use walrus_names::marketplace;
+    use walrus_names::marketplace::{Self, Offer};
     use walrus_names::royalty_rule;
 
-    const ADMIN: address = @0xA;
-    const ALICE: address = @0xA11CE;
-    const BOB:   address = @0xB0B;
+    const ADMIN:   address = @0xA;
+    const ALICE:   address = @0xA11CE;
+    const BOB:     address = @0xB0B;
+    const CHARLIE: address = @0xC4A12;
 
     const PRICE:    u64 = 1_000_000_000;   // 1 SUI
     const FEE_BPS:  u64 = 100;             // 1%
@@ -263,6 +264,221 @@ module walrus_names::marketplace_tests {
             let cap = ts::take_from_sender<NameCap>(&sc);
             assert!(walrus_names::name_of(&cap) == string::utf8(b"alice"), 0);
             ts::return_to_sender(&sc, cap);
+        };
+        ts::end(sc);
+    }
+
+    // =====================================================================
+    // BID: place_offer -> accept_offer. Royalty collected, atomic swap.
+    // =====================================================================
+
+    #[test]
+    fun offer_accepted_swaps_and_collects_royalty() {
+        let mut sc = ts::begin(ADMIN);
+        setup(&mut sc);
+        let id = alice_lists(&mut sc);
+
+        // BOB places an offer of PRICE on "alice"
+        ts::next_tx(&mut sc, BOB);
+        {
+            let pay = mint(&mut sc, PRICE);
+            marketplace::place_offer(id, string::utf8(b"alice"), pay, ts::ctx(&mut sc));
+        };
+
+        // ALICE accepts: BOB gets the cap, ALICE gets PRICE - FEE, policy gets FEE
+        ts::next_tx(&mut sc, ALICE);
+        {
+            let offer = ts::take_shared<Offer>(&sc);
+            let mut kk  = ts::take_shared<Kiosk>(&sc);
+            let kcap = ts::take_from_sender<KioskOwnerCap>(&sc);
+            let mut pol = ts::take_shared<TransferPolicy<NameCap>>(&sc);
+            let mut reg = ts::take_shared<Registry>(&sc);
+            marketplace::accept_offer(offer, &mut kk, &kcap, &mut pol, &mut reg, ts::ctx(&mut sc));
+            assert!(walrus_names::owner_of(&reg, string::utf8(b"alice")) == BOB, 0);
+            ts::return_shared(kk);
+            ts::return_to_sender(&sc, kcap);
+            ts::return_shared(pol);
+            ts::return_shared(reg);
+        };
+        // BOB received the NameCap
+        ts::next_tx(&mut sc, BOB);
+        {
+            let cap = ts::take_from_sender<NameCap>(&sc);
+            assert!(walrus_names::name_of(&cap) == string::utf8(b"alice"), 1);
+            ts::return_to_sender(&sc, cap);
+        };
+        // ALICE received PRICE - FEE
+        ts::next_tx(&mut sc, ALICE);
+        {
+            let c = ts::take_from_sender<Coin<SUI>>(&sc);
+            assert!(coin::value(&c) == PRICE - FEE, 2);
+            coin::burn_for_testing(c);
+        };
+        // policy holds FEE
+        ts::next_tx(&mut sc, ADMIN);
+        {
+            let mut pol = ts::take_shared<TransferPolicy<NameCap>>(&sc);
+            let pcap = ts::take_from_sender<TransferPolicyCap<NameCap>>(&sc);
+            marketplace::withdraw_royalties(&mut pol, &pcap, ts::ctx(&mut sc));
+            ts::return_shared(pol);
+            ts::return_to_sender(&sc, pcap);
+        };
+        ts::next_tx(&mut sc, ADMIN);
+        {
+            let c = ts::take_from_sender<Coin<SUI>>(&sc);
+            assert!(coin::value(&c) == FEE, 3);
+            coin::burn_for_testing(c);
+        };
+        ts::end(sc);
+    }
+
+    // BID: bidder can cancel and reclaim the full escrow
+    #[test]
+    fun offer_cancel_refunds_bidder() {
+        let mut sc = ts::begin(ADMIN);
+        setup(&mut sc);
+        let id = alice_lists(&mut sc);
+
+        ts::next_tx(&mut sc, BOB);
+        {
+            let pay = mint(&mut sc, PRICE);
+            marketplace::place_offer(id, string::utf8(b"alice"), pay, ts::ctx(&mut sc));
+        };
+        ts::next_tx(&mut sc, BOB);
+        {
+            let offer = ts::take_shared<Offer>(&sc);
+            marketplace::cancel_offer(offer, ts::ctx(&mut sc));
+        };
+        ts::next_tx(&mut sc, BOB);
+        {
+            let c = ts::take_from_sender<Coin<SUI>>(&sc);
+            assert!(coin::value(&c) == PRICE, 0);
+            coin::burn_for_testing(c);
+        };
+        ts::end(sc);
+    }
+
+    // BID: only the original bidder can cancel (ENotBidder = 105)
+    #[test]
+    #[expected_failure(abort_code = 105, location = marketplace)]
+    fun offer_cancel_by_non_bidder_aborts() {
+        let mut sc = ts::begin(ADMIN);
+        setup(&mut sc);
+        let id = alice_lists(&mut sc);
+
+        ts::next_tx(&mut sc, BOB);
+        {
+            let pay = mint(&mut sc, PRICE);
+            marketplace::place_offer(id, string::utf8(b"alice"), pay, ts::ctx(&mut sc));
+        };
+        ts::next_tx(&mut sc, CHARLIE);
+        {
+            let offer = ts::take_shared<Offer>(&sc);
+            marketplace::cancel_offer(offer, ts::ctx(&mut sc));
+        };
+        ts::end(sc);
+    }
+
+    // BID: seller cannot accept their own offer (ESelfBuy = 100)
+    #[test]
+    #[expected_failure(abort_code = 100, location = marketplace)]
+    fun offer_self_accept_aborts() {
+        let mut sc = ts::begin(ADMIN);
+        setup(&mut sc);
+        let id = alice_lists(&mut sc);
+
+        // ALICE bids on her own listing
+        ts::next_tx(&mut sc, ALICE);
+        {
+            let pay = mint(&mut sc, PRICE);
+            marketplace::place_offer(id, string::utf8(b"alice"), pay, ts::ctx(&mut sc));
+        };
+        // ALICE tries to accept it -> seller == bidder
+        ts::next_tx(&mut sc, ALICE);
+        {
+            let offer = ts::take_shared<Offer>(&sc);
+            let mut kk  = ts::take_shared<Kiosk>(&sc);
+            let kcap = ts::take_from_sender<KioskOwnerCap>(&sc);
+            let mut pol = ts::take_shared<TransferPolicy<NameCap>>(&sc);
+            let mut reg = ts::take_shared<Registry>(&sc);
+            marketplace::accept_offer(offer, &mut kk, &kcap, &mut pol, &mut reg, ts::ctx(&mut sc));
+            ts::return_shared(kk);
+            ts::return_to_sender(&sc, kcap);
+            ts::return_shared(pol);
+            ts::return_shared(reg);
+        };
+        ts::end(sc);
+    }
+
+    // BID: accept aborts if the offer's name doesn't match the cap (ENameMismatch = 106)
+    #[test]
+    #[expected_failure(abort_code = 106, location = marketplace)]
+    fun offer_name_mismatch_aborts() {
+        let mut sc = ts::begin(ADMIN);
+        setup(&mut sc);
+        let id = alice_lists(&mut sc);
+
+        // BOB offers on the right cap id but a wrong name
+        ts::next_tx(&mut sc, BOB);
+        {
+            let pay = mint(&mut sc, PRICE);
+            marketplace::place_offer(id, string::utf8(b"wrongname"), pay, ts::ctx(&mut sc));
+        };
+        ts::next_tx(&mut sc, ALICE);
+        {
+            let offer = ts::take_shared<Offer>(&sc);
+            let mut kk  = ts::take_shared<Kiosk>(&sc);
+            let kcap = ts::take_from_sender<KioskOwnerCap>(&sc);
+            let mut pol = ts::take_shared<TransferPolicy<NameCap>>(&sc);
+            let mut reg = ts::take_shared<Registry>(&sc);
+            marketplace::accept_offer(offer, &mut kk, &kcap, &mut pol, &mut reg, ts::ctx(&mut sc));
+            ts::return_shared(kk);
+            ts::return_to_sender(&sc, kcap);
+            ts::return_shared(pol);
+            ts::return_shared(reg);
+        };
+        ts::end(sc);
+    }
+
+    // =====================================================================
+    // N-1 EXPLOIT: if a SECOND (rule-less) TransferPolicy<NameCap> exists, a
+    // buyer can bypass the royalty entirely via direct kiosk::purchase +
+    // confirm_request against the rogue policy. confirm_request binds only to
+    // the TYPE NameCap, not to a specific policy object.
+    //
+    // This test PASSES (no abort) on purpose: it demonstrates the bypass is
+    // possible while the Publisher is alive (a second policy can be created).
+    // The mitigation is burning the Publisher after init_policy, which makes a
+    // second TransferPolicy<NameCap> impossible to create forever.
+    // =====================================================================
+
+    #[test]
+    fun rogue_policy_enables_zero_fee_bypass() {
+        let mut sc = ts::begin(ADMIN);
+        setup(&mut sc);
+        let id = alice_lists(&mut sc);
+
+        // Attacker (or compromised deployer) creates a SECOND, rule-less policy.
+        // In production this requires the Publisher — hence the need to burn it.
+        ts::next_tx(&mut sc, BOB);
+        {
+            let (rogue_policy, rogue_cap) =
+                transfer_policy::new_for_testing<NameCap>(ts::ctx(&mut sc));
+
+            let mut kk = ts::take_shared<Kiosk>(&sc);
+            let pay = mint(&mut sc, PRICE); // pays ONLY the price, zero royalty
+
+            let (cap, request) = kiosk::purchase<NameCap>(&mut kk, id, pay);
+            // Confirm against the rogue (no-rule) policy — succeeds with 0 receipts:
+            transfer_policy::confirm_request(&rogue_policy, request);
+
+            // Buyer now owns the name having paid zero protocol fee.
+            assert!(walrus_names::name_of(&cap) == string::utf8(b"alice"), 0);
+
+            transfer::public_transfer(cap, BOB);
+            transfer::public_share_object(rogue_policy);
+            transfer::public_transfer(rogue_cap, BOB);
+            ts::return_shared(kk);
         };
         ts::end(sc);
     }
