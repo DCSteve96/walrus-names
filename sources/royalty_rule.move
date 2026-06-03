@@ -34,6 +34,12 @@ module walrus_names::royalty_rule {
 
     public struct Rule has drop {}
 
+    /// R-1 fix: hard cap sulla royalty applicato QUI (non solo nel wrapper
+    /// marketplace::update_policy_fee), così non è aggirabile chiamando
+    /// add/update_fee direttamente col TransferPolicyCap.
+    const MAX_FEE_BPS: u64 = 1_000; // 10%
+    const EFeeTooHigh: u64 = 0;     // fee_bps > MAX_FEE_BPS
+
     // =========================================================================
     // Config stored inside the TransferPolicy
     // =========================================================================
@@ -55,6 +61,7 @@ module walrus_names::royalty_rule {
         policy_cap: &TransferPolicyCap<NameCap>,
         fee_bps:    u64,
     ) {
+        assert!(fee_bps <= MAX_FEE_BPS, EFeeTooHigh);
         transfer_policy::add_rule(Rule {}, policy, policy_cap, RoyaltyConfig { fee_bps });
     }
 
@@ -64,6 +71,7 @@ module walrus_names::royalty_rule {
         policy_cap: &TransferPolicyCap<NameCap>,
         fee_bps:    u64,
     ) {
+        assert!(fee_bps <= MAX_FEE_BPS, EFeeTooHigh);
         // Remove old rule and re-add with new config
         transfer_policy::remove_rule<NameCap, Rule, RoyaltyConfig>(policy, policy_cap);
         transfer_policy::add_rule(Rule {}, policy, policy_cap, RoyaltyConfig { fee_bps });

@@ -42,6 +42,7 @@ module walrus_names::walrus_names {
     const ESelfProposal:        u64 = 11; // #4: propose_admin to self
     const EPendingAdminExists:  u64 = 12; // #4: overwrite protection
     const ENumericOnly:         u64 = 13; // #11: pure numeric names blocked
+    const EWrongVersion:        u64 = 14; // version-gating: shared object migrated to a newer version
 
     // =========================================================================
     // Constants
@@ -52,6 +53,10 @@ module walrus_names::walrus_names {
     const MIN_LEN:      u64 = 3;
     const MAX_LEN:      u64 = 63;
     const MAX_BLOB_LEN: u64 = 256;
+    /// Version corrente del package. Si incrementa ad ogni upgrade; dopo l'upgrade
+    /// si chiama migrate() per portare gli oggetti condivisi a questa versione,
+    /// disattivando così le funzioni delle versioni precedenti (assert_version).
+    const VERSION:      u64 = 1;
 
     // =========================================================================
     // Structs
@@ -64,6 +69,7 @@ module walrus_names::walrus_names {
     /// #13: tracks current_admin for accurate AdminTransferred events.
     public struct WalNamesTreasury has key {
         id:            UID,
+        version:       u64,                  // version-gating
         balance:       Balance<SUI>,
         fee_base:      u64,
         current_admin: address,
@@ -74,6 +80,7 @@ module walrus_names::walrus_names {
     /// Shared registry — single source of truth for all `.epoch` names.
     public struct Registry has key {
         id:               UID,
+        version:          u64,               // version-gating
         records:          Table<String, NameRecord>,
         total_registered: u64,
     }
@@ -130,6 +137,7 @@ module walrus_names::walrus_names {
 
         transfer::share_object(WalNamesTreasury {
             id:            object::new(ctx),
+            version:       VERSION,
             balance:       balance::zero<SUI>(),
             fee_base:      FEE_BASE,
             current_admin: deployer,
@@ -139,9 +147,38 @@ module walrus_names::walrus_names {
 
         transfer::share_object(Registry {
             id:               object::new(ctx),
+            version:          VERSION,
             records:          table::new(ctx),
             total_registered: 0,
         });
+    }
+
+    // =========================================================================
+    // Version-gating
+    // =========================================================================
+
+    /// Abortisce se l'oggetto è stato migrato a una versione più recente di quella
+    /// con cui questo package è stato compilato. Usato per disattivare le funzioni
+    /// dei package vecchi dopo un upgrade + migrate().
+    public fun assert_treasury_version(treasury: &WalNamesTreasury) {
+        assert!(treasury.version == VERSION, EWrongVersion);
+    }
+    public fun assert_registry_version(registry: &Registry) {
+        assert!(registry.version == VERSION, EWrongVersion);
+    }
+
+    /// Da chiamare UNA volta dopo ogni upgrade: porta gli oggetti condivisi alla
+    /// VERSION corrente, disattivando le funzioni delle versioni precedenti.
+    /// Solo AdminCap. Non può abbassare la versione.
+    public fun migrate(
+        _cap:     &AdminCap,
+        treasury: &mut WalNamesTreasury,
+        registry: &mut Registry,
+    ) {
+        assert!(treasury.version < VERSION, EWrongVersion);
+        assert!(registry.version < VERSION, EWrongVersion);
+        treasury.version = VERSION;
+        registry.version = VERSION;
     }
 
     // =========================================================================
@@ -168,6 +205,8 @@ module walrus_names::walrus_names {
         mut payment: Coin<SUI>,
         ctx:      &mut TxContext,
     ) {
+        assert!(registry.version == VERSION, EWrongVersion);
+        assert!(treasury.version == VERSION, EWrongVersion);
         let bytes    = string::as_bytes(&name);
         let name_len = vector::length(bytes);
         let blob_len = string::length(&blob_id);
@@ -183,6 +222,11 @@ module walrus_names::walrus_names {
         let whitelisted = table::contains(&treasury.whitelist, sender);
 
         if (whitelisted) {
+            // One-shot whitelist: consuma SUBITO l'entry così non può essere
+            // riusata per registrare più nomi gratis nella stessa PTB.
+            // Il prossimo register in tx troverà whitelisted = false → paga la fee.
+            table::remove(&mut treasury.whitelist, sender);
+            event::emit(WhitelistRemoved { wallet: sender });
             // Whitelist: no fee, return full payment to sender
             if (coin::value(&payment) > 0) {
                 transfer::public_transfer(payment, sender);
@@ -220,6 +264,7 @@ module walrus_names::walrus_names {
         new_blob_id: String,
         _ctx:        &mut TxContext,
     ) {
+        assert!(registry.version == VERSION, EWrongVersion);
         let blob_len = string::length(&new_blob_id);
         assert!(blob_len > 0,             EBlobIdEmpty);
         assert!(blob_len <= MAX_BLOB_LEN, EBlobIdTooLong);
@@ -238,6 +283,7 @@ module walrus_names::walrus_names {
         to:       address,
         _ctx:     &mut TxContext,
     ) {
+        assert!(registry.version == VERSION, EWrongVersion);
         let from = table::borrow(&registry.records, cap.name).owner;
         table::borrow_mut(&mut registry.records, cap.name).owner = to;
         event::emit(NameTransferred { name: cap.name, from, to });
@@ -252,6 +298,7 @@ module walrus_names::walrus_names {
         cap:      &NameCap,
         ctx:      &mut TxContext,
     ) {
+        assert!(registry.version == VERSION, EWrongVersion);
         let new_owner = ctx.sender();
         let record = table::borrow_mut(&mut registry.records, cap.name);
         let old_owner = record.owner;
@@ -269,6 +316,7 @@ module walrus_names::walrus_names {
         treasury: &mut WalNamesTreasury,
         ctx:      &mut TxContext,
     ) {
+        assert!(treasury.version == VERSION, EWrongVersion);
         let amount = treasury.balance.value();
         if (amount > 0) {
             let payout = coin::from_balance(treasury.balance.split(amount), ctx);
@@ -282,6 +330,7 @@ module walrus_names::walrus_names {
         treasury:     &mut WalNamesTreasury,
         new_fee_base: u64,
     ) {
+        assert!(treasury.version == VERSION, EWrongVersion);
         assert!(new_fee_base <= MAX_FEE_BASE, EFeeTooHigh);
         let old = treasury.fee_base;
         treasury.fee_base = new_fee_base;
@@ -298,6 +347,7 @@ module walrus_names::walrus_names {
         treasury: &mut WalNamesTreasury,
         wallet:   address,
     ) {
+        assert!(treasury.version == VERSION, EWrongVersion);
         if (!table::contains(&treasury.whitelist, wallet)) {
             table::add(&mut treasury.whitelist, wallet, true);
             event::emit(WhitelistAdded { wallet });
@@ -310,6 +360,7 @@ module walrus_names::walrus_names {
         treasury: &mut WalNamesTreasury,
         wallet:   address,
     ) {
+        assert!(treasury.version == VERSION, EWrongVersion);
         if (table::contains(&treasury.whitelist, wallet)) {
             table::remove(&mut treasury.whitelist, wallet);
             event::emit(WhitelistRemoved { wallet });
@@ -340,6 +391,7 @@ module walrus_names::walrus_names {
         proposed: address,
         ctx:      &mut TxContext,
     ) {
+        assert!(treasury.version == VERSION, EWrongVersion);
         // #4: no self-proposal
         assert!(proposed != ctx.sender(), ESelfProposal);
         // #4: no silent overwrite of existing pending proposal
@@ -354,6 +406,7 @@ module walrus_names::walrus_names {
         _cap:     &AdminCap,
         treasury: &mut WalNamesTreasury,
     ) {
+        assert!(treasury.version == VERSION, EWrongVersion);
         treasury.pending_admin = option::none();
     }
 
@@ -365,6 +418,7 @@ module walrus_names::walrus_names {
         cap:      AdminCap,
         treasury: &WalNamesTreasury,
     ) {
+        assert!(treasury.version == VERSION, EWrongVersion);
         assert!(option::is_some(&treasury.pending_admin), ENoPendingAdmin);
         let to = *option::borrow(&treasury.pending_admin);
         transfer::transfer(cap, to);
@@ -378,6 +432,7 @@ module walrus_names::walrus_names {
         treasury: &mut WalNamesTreasury,
         ctx:      &mut TxContext,
     ) {
+        assert!(treasury.version == VERSION, EWrongVersion);
         let caller = ctx.sender();
         assert!(option::is_some(&treasury.pending_admin), ENoPendingAdmin);
         let pending = *option::borrow(&treasury.pending_admin);
@@ -448,6 +503,7 @@ module walrus_names::walrus_names {
         transfer::transfer(AdminCap { id: object::new(ctx) }, deployer);
         transfer::share_object(WalNamesTreasury {
             id:            object::new(ctx),
+            version:       VERSION,
             balance:       balance::zero<SUI>(),
             fee_base:      FEE_BASE,
             current_admin: deployer,
@@ -456,6 +512,7 @@ module walrus_names::walrus_names {
         });
         transfer::share_object(Registry {
             id:               object::new(ctx),
+            version:          VERSION,
             records:          table::new(ctx),
             total_registered: 0,
         });

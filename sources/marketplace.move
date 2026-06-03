@@ -37,6 +37,7 @@ module walrus_names::marketplace {
     const EOfferNotExpired:     u64 = 108; // B-2: cannot reclaim before expiry
     #[allow(unused_const)]
     const EOfferAmountTooLow:   u64 = 109; // B-4: reserved, fee handled via coin::destroy_zero
+    const EOfferExpired:        u64 = 110; // OF-1: cannot accept an expired offer
 
     // =========================================================================
     // Constants
@@ -156,6 +157,7 @@ module walrus_names::marketplace {
         price:            u64,
         ctx:              &mut TxContext,
     ) {
+        walrus_names::assert_registry_version(registry);
         assert!(price > 0, EZeroPrice);
 
         let seller      = ctx.sender();
@@ -210,6 +212,7 @@ module walrus_names::marketplace {
         mut payment:  Coin<SUI>,
         ctx:          &mut TxContext,
     ) {
+        walrus_names::assert_registry_version(registry);
         let buyer  = ctx.sender();
         // NOTE (M-3 residual): kiosk::owner() can be spoofed via set_owner_custom.
         // This does NOT enable theft — the cap is still locked in the kiosk and
@@ -274,6 +277,7 @@ module walrus_names::marketplace {
         payment:     Coin<SUI>,
         ctx:         &mut TxContext,
     ) {
+        walrus_names::assert_registry_version(registry);
         // B-1: name must exist in the registry (not available = registered)
         assert!(!walrus_names::is_available(registry, name), ENameNotRegistered);
 
@@ -307,10 +311,16 @@ module walrus_names::marketplace {
         seller_kiosk_cap: &KioskOwnerCap,
         policy:           &mut TransferPolicy<NameCap>,
         registry:         &mut Registry,
+        clock:            &Clock,
         ctx:              &mut TxContext,
     ) {
-        let Offer { id, name, name_cap_id, bidder, mut payment, expiry: _ } = offer;
+        walrus_names::assert_registry_version(registry);
+        let Offer { id, name, name_cap_id, bidder, mut payment, expiry } = offer;
         object::delete(id);
+
+        // OF-1: un'offerta scaduta non è più accettabile (il bidder può solo
+        // reclaimarla). expiry == 0 = nessuna scadenza.
+        assert!(expiry == 0 || clock::timestamp_ms(clock) < expiry, EOfferExpired);
 
         let seller = ctx.sender();
         assert!(seller != bidder, ESelfBuy);
@@ -368,7 +378,7 @@ module walrus_names::marketplace {
     public fun reclaim_expired_offer(
         offer: Offer,
         clock: &Clock,
-        ctx:   &mut TxContext,
+        _ctx:  &mut TxContext,
     ) {
         let Offer { id, name, name_cap_id, bidder, payment, expiry } = offer;
         object::delete(id);

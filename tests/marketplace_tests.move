@@ -4,6 +4,7 @@ module walrus_names::marketplace_tests {
     use sui::coin::{Self, Coin};
     use sui::kiosk::{Self, Kiosk, KioskOwnerCap};
     use sui::sui::SUI;
+    use sui::clock;
     use sui::test_scenario as ts;
     use sui::transfer_policy::{Self, TransferPolicy, TransferPolicyCap};
     use walrus_names::walrus_names::{Self, Registry, NameCap};
@@ -73,6 +74,29 @@ module walrus_names::marketplace_tests {
             ts::return_shared(reg);
         };
         id
+    }
+
+    // =====================================================================
+    // R-1: la royalty non può superare il 10% — cap APPLICATO DENTRO
+    // royalty_rule, quindi non aggirabile chiamando update_fee direttamente
+    // col TransferPolicyCap (bypassando marketplace::update_policy_fee).
+    // =====================================================================
+
+    #[test]
+    #[expected_failure(abort_code = 0, location = royalty_rule)] // EFeeTooHigh
+    fun royalty_fee_capped_at_10pct() {
+        let mut sc = ts::begin(ADMIN);
+        setup(&mut sc);
+        ts::next_tx(&mut sc, ADMIN);
+        {
+            let mut pol  = ts::take_shared<TransferPolicy<NameCap>>(&sc);
+            let pcap = ts::take_from_sender<TransferPolicyCap<NameCap>>(&sc);
+            // 1_001 bps = 10.01% > MAX_FEE_BPS (1_000) -> abort
+            royalty_rule::update_fee(&mut pol, &pcap, 1_001);
+            ts::return_shared(pol);
+            ts::return_to_sender(&sc, pcap);
+        };
+        ts::end(sc);
     }
 
     // =====================================================================
@@ -281,8 +305,10 @@ module walrus_names::marketplace_tests {
         // BOB places an offer of PRICE on "alice"
         ts::next_tx(&mut sc, BOB);
         {
+            let reg = ts::take_shared<Registry>(&sc);
             let pay = mint(&mut sc, PRICE);
-            marketplace::place_offer(id, string::utf8(b"alice"), pay, ts::ctx(&mut sc));
+            marketplace::place_offer(&reg, id, string::utf8(b"alice"), 0, pay, ts::ctx(&mut sc));
+            ts::return_shared(reg);
         };
 
         // ALICE accepts: BOB gets the cap, ALICE gets PRICE - FEE, policy gets FEE
@@ -293,7 +319,9 @@ module walrus_names::marketplace_tests {
             let kcap = ts::take_from_sender<KioskOwnerCap>(&sc);
             let mut pol = ts::take_shared<TransferPolicy<NameCap>>(&sc);
             let mut reg = ts::take_shared<Registry>(&sc);
-            marketplace::accept_offer(offer, &mut kk, &kcap, &mut pol, &mut reg, ts::ctx(&mut sc));
+            let clk = clock::create_for_testing(ts::ctx(&mut sc));
+            marketplace::accept_offer(offer, &mut kk, &kcap, &mut pol, &mut reg, &clk, ts::ctx(&mut sc));
+            clock::destroy_for_testing(clk);
             assert!(walrus_names::owner_of(&reg, string::utf8(b"alice")) == BOB, 0);
             ts::return_shared(kk);
             ts::return_to_sender(&sc, kcap);
@@ -341,8 +369,10 @@ module walrus_names::marketplace_tests {
 
         ts::next_tx(&mut sc, BOB);
         {
+            let reg = ts::take_shared<Registry>(&sc);
             let pay = mint(&mut sc, PRICE);
-            marketplace::place_offer(id, string::utf8(b"alice"), pay, ts::ctx(&mut sc));
+            marketplace::place_offer(&reg, id, string::utf8(b"alice"), 0, pay, ts::ctx(&mut sc));
+            ts::return_shared(reg);
         };
         ts::next_tx(&mut sc, BOB);
         {
@@ -368,8 +398,10 @@ module walrus_names::marketplace_tests {
 
         ts::next_tx(&mut sc, BOB);
         {
+            let reg = ts::take_shared<Registry>(&sc);
             let pay = mint(&mut sc, PRICE);
-            marketplace::place_offer(id, string::utf8(b"alice"), pay, ts::ctx(&mut sc));
+            marketplace::place_offer(&reg, id, string::utf8(b"alice"), 0, pay, ts::ctx(&mut sc));
+            ts::return_shared(reg);
         };
         ts::next_tx(&mut sc, CHARLIE);
         {
@@ -390,8 +422,10 @@ module walrus_names::marketplace_tests {
         // ALICE bids on her own listing
         ts::next_tx(&mut sc, ALICE);
         {
+            let reg = ts::take_shared<Registry>(&sc);
             let pay = mint(&mut sc, PRICE);
-            marketplace::place_offer(id, string::utf8(b"alice"), pay, ts::ctx(&mut sc));
+            marketplace::place_offer(&reg, id, string::utf8(b"alice"), 0, pay, ts::ctx(&mut sc));
+            ts::return_shared(reg);
         };
         // ALICE tries to accept it -> seller == bidder
         ts::next_tx(&mut sc, ALICE);
@@ -401,7 +435,9 @@ module walrus_names::marketplace_tests {
             let kcap = ts::take_from_sender<KioskOwnerCap>(&sc);
             let mut pol = ts::take_shared<TransferPolicy<NameCap>>(&sc);
             let mut reg = ts::take_shared<Registry>(&sc);
-            marketplace::accept_offer(offer, &mut kk, &kcap, &mut pol, &mut reg, ts::ctx(&mut sc));
+            let clk = clock::create_for_testing(ts::ctx(&mut sc));
+            marketplace::accept_offer(offer, &mut kk, &kcap, &mut pol, &mut reg, &clk, ts::ctx(&mut sc));
+            clock::destroy_for_testing(clk);
             ts::return_shared(kk);
             ts::return_to_sender(&sc, kcap);
             ts::return_shared(pol);
@@ -410,19 +446,22 @@ module walrus_names::marketplace_tests {
         ts::end(sc);
     }
 
-    // BID: accept aborts if the offer's name doesn't match the cap (ENameMismatch = 106)
+    // BID: B-1 — non si può offrire su un nome NON registrato (ENameNotRegistered = 107).
+    // (Con l'hardening B-1 questo è bloccato già in place_offer, prima di accept_offer.)
     #[test]
-    #[expected_failure(abort_code = 106, location = marketplace)]
-    fun offer_name_mismatch_aborts() {
+    #[expected_failure(abort_code = 107, location = marketplace)]
+    fun offer_on_unregistered_name_aborts() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
         let id = alice_lists(&mut sc);
 
-        // BOB offers on the right cap id but a wrong name
+        // BOB offers on the right cap id but a name that isn't registered
         ts::next_tx(&mut sc, BOB);
         {
+            let reg = ts::take_shared<Registry>(&sc);
             let pay = mint(&mut sc, PRICE);
-            marketplace::place_offer(id, string::utf8(b"wrongname"), pay, ts::ctx(&mut sc));
+            marketplace::place_offer(&reg, id, string::utf8(b"wrongname"), 0, pay, ts::ctx(&mut sc));
+            ts::return_shared(reg);
         };
         ts::next_tx(&mut sc, ALICE);
         {
@@ -431,7 +470,9 @@ module walrus_names::marketplace_tests {
             let kcap = ts::take_from_sender<KioskOwnerCap>(&sc);
             let mut pol = ts::take_shared<TransferPolicy<NameCap>>(&sc);
             let mut reg = ts::take_shared<Registry>(&sc);
-            marketplace::accept_offer(offer, &mut kk, &kcap, &mut pol, &mut reg, ts::ctx(&mut sc));
+            let clk = clock::create_for_testing(ts::ctx(&mut sc));
+            marketplace::accept_offer(offer, &mut kk, &kcap, &mut pol, &mut reg, &clk, ts::ctx(&mut sc));
+            clock::destroy_for_testing(clk);
             ts::return_shared(kk);
             ts::return_to_sender(&sc, kcap);
             ts::return_shared(pol);

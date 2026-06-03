@@ -307,4 +307,50 @@ module walrus_names::walrus_names_tests {
         };
         ts::end(sc);
     }
+
+    // -- whitelist is ONE-SHOT: consumed on first use, 2nd register pays fee ---
+
+    #[test]
+    #[expected_failure(abort_code = 4)] // EInsufficientFee on the 2nd registration
+    fun whitelist_is_one_shot() {
+        let mut sc = ts::begin(ADMIN);
+        init_protocol(&mut sc);
+
+        // ADMIN whitelists ALICE (single grant)
+        ts::next_tx(&mut sc, ADMIN);
+        {
+            let cap = ts::take_from_sender<AdminCap>(&sc);
+            let mut tre = ts::take_shared<WalNamesTreasury>(&sc);
+            walrus_names::whitelist_add(&cap, &mut tre, ALICE);
+            ts::return_to_sender(&sc, cap);
+            ts::return_shared(tre);
+        };
+
+        // 1st registration: free (consumes the whitelist entry)
+        ts::next_tx(&mut sc, ALICE);
+        {
+            let mut reg = ts::take_shared<Registry>(&sc);
+            let mut tre = ts::take_shared<WalNamesTreasury>(&sc);
+            let pay = mint(&mut sc, 100);
+            walrus_names::register(&mut reg, &mut tre,
+                string::utf8(b"abc"), string::utf8(b"b"), pay, ts::ctx(&mut sc));
+            assert!(!walrus_names::is_whitelisted(&tre, ALICE), 0); // consumed
+            ts::return_shared(reg);
+            ts::return_shared(tre);
+        };
+
+        // 2nd registration by the same wallet: no longer whitelisted -> must pay,
+        // 100 mist is not enough for a 3-char name -> EInsufficientFee
+        ts::next_tx(&mut sc, ALICE);
+        {
+            let mut reg = ts::take_shared<Registry>(&sc);
+            let mut tre = ts::take_shared<WalNamesTreasury>(&sc);
+            let pay = mint(&mut sc, 100);
+            walrus_names::register(&mut reg, &mut tre,
+                string::utf8(b"xyz"), string::utf8(b"b"), pay, ts::ctx(&mut sc));
+            ts::return_shared(reg);
+            ts::return_shared(tre);
+        };
+        ts::end(sc);
+    }
 }
