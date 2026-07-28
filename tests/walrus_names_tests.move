@@ -353,4 +353,49 @@ module walrus_names::walrus_names_tests {
         };
         ts::end(sc);
     }
+
+    // -- partner launch (v2) --------------------------------------------------
+
+    #[test]
+    fun record_partner_launch_deposits_and_withdraws() {
+        let mut sc = ts::begin(ADMIN);
+        init_protocol(&mut sc);
+
+        // ALICE (a partner integration) routes a 3 SUI cut into the treasury
+        ts::next_tx(&mut sc, ALICE);
+        {
+            let mut tre = ts::take_shared<WalNamesTreasury>(&sc);
+            assert!(walrus_names::treasury_balance(&tre) == 0, 0);
+            let cut = mint(&mut sc, 3_000_000_000);
+            walrus_names::record_partner_launch(
+                &mut tre,
+                string::utf8(b"suipump"),
+                string::utf8(b"alice"),
+                cut,
+                ts::ctx(&mut sc),
+            );
+            // the whole cut landed in the treasury
+            assert!(walrus_names::treasury_balance(&tre) == 3_000_000_000, 1);
+            ts::return_shared(tre);
+        };
+
+        // ADMIN can withdraw the accrued partner revenue (same treasury as fees)
+        ts::next_tx(&mut sc, ADMIN);
+        {
+            let cap = ts::take_from_sender<AdminCap>(&sc);
+            let mut tre = ts::take_shared<WalNamesTreasury>(&sc);
+            walrus_names::withdraw_fees(&cap, &mut tre, ts::ctx(&mut sc));
+            assert!(walrus_names::treasury_balance(&tre) == 0, 2);
+            ts::return_shared(tre);
+            ts::return_to_sender(&sc, cap);
+        };
+        // ADMIN received exactly the 3 SUI payout
+        ts::next_tx(&mut sc, ADMIN);
+        {
+            let payout = ts::take_from_sender<coin::Coin<SUI>>(&sc);
+            assert!(coin::value(&payout) == 3_000_000_000, 3);
+            ts::return_to_sender(&sc, payout);
+        };
+        ts::end(sc);
+    }
 }

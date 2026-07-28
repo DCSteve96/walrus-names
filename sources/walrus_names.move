@@ -53,9 +53,12 @@ module walrus_names::walrus_names {
     const MIN_LEN:      u64 = 3;
     const MAX_LEN:      u64 = 63;
     const MAX_BLOB_LEN: u64 = 256;
-    /// Version corrente del package. Si incrementa ad ogni upgrade; dopo l'upgrade
-    /// si chiama migrate() per portare gli oggetti condivisi a questa versione,
-    /// disattivando così le funzioni delle versioni precedenti (assert_version).
+    /// Version corrente del package. Si incrementa solo agli upgrade *che
+    /// richiedono migrate()* per portare gli oggetti condivisi alla nuova
+    /// versione, disattivando le funzioni delle versioni precedenti (assert_version).
+    /// L'upgrade additivo che ha aggiunto record_partner_launch / treasury_balance
+    /// NON cambia VERSION: è retro-compatibile, gira senza migrate, e il package
+    /// precedente resta valido (nessuna fix di sicurezza che imponga di disattivarlo).
     const VERSION:      u64 = 1;
 
     // =========================================================================
@@ -111,6 +114,12 @@ module walrus_names::walrus_names {
     public struct AdminTransferred has copy, drop { old_admin: address, new_admin: address }
     public struct WhitelistAdded   has copy, drop { wallet: address }
     public struct WhitelistRemoved has copy, drop { wallet: address }
+
+    /// v2 — emitted when an integrated partner (e.g. a launchpad) routes a
+    /// revenue cut to Epoch as part of a launch. `partner` is a free-form tag
+    /// (e.g. "suipump"), `name` the `.epoch` name tied to the launch ("" if
+    /// none). Lets the partner prove and index the payment on-chain.
+    public struct PartnerLaunch    has copy, drop { partner: String, name: String, payer: address, amount: u64 }
 
     // =========================================================================
     // Init
@@ -307,6 +316,34 @@ module walrus_names::walrus_names {
     }
 
     // =========================================================================
+    // Partner launches (v2 — additive)
+    //
+    // Lets an integrated partner (e.g. a launchpad) atomically route a revenue
+    // cut into the Epoch treasury and emit a provable, indexable event tying
+    // that payment to the partner and the `.epoch` name used. Permissionless:
+    // the caller's own launch tx supplies the coin and the tag, so it composes
+    // inside the partner's PTB with no Epoch-side signature required.
+    // =========================================================================
+
+    /// Route a partner revenue cut into the treasury and emit PartnerLaunch.
+    /// The whole `payment` is deposited (the caller splits the exact cut before
+    /// calling). `partner` is a free-form tag (e.g. "suipump"); `name` is the
+    /// `.epoch` name tied to the launch (empty string if none).
+    public fun record_partner_launch(
+        treasury: &mut WalNamesTreasury,
+        partner:  String,
+        name:     String,
+        payment:  Coin<SUI>,
+        ctx:      &mut TxContext,
+    ) {
+        assert!(treasury.version == VERSION, EWrongVersion);
+        let payer  = ctx.sender();
+        let amount = coin::value(&payment);
+        balance::join(&mut treasury.balance, coin::into_balance(payment));
+        event::emit(PartnerLaunch { partner, name, payer, amount });
+    }
+
+    // =========================================================================
     // Admin functions
     // =========================================================================
 
@@ -470,6 +507,7 @@ module walrus_names::walrus_names {
 
     public fun total_registered(registry: &Registry): u64 { registry.total_registered }
     public fun fee_base(treasury: &WalNamesTreasury): u64 { treasury.fee_base }
+    public fun treasury_balance(treasury: &WalNamesTreasury): u64 { balance::value(&treasury.balance) }
     public fun current_admin(treasury: &WalNamesTreasury): address { treasury.current_admin }
     public fun max_fee_base(): u64 { MAX_FEE_BASE }
 
